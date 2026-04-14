@@ -4,11 +4,13 @@ import matplotlib.dates as mdates
 import matplotlib.ticker as mticker
 import numpy as np
 
-# --- VERSION 2.26 MASTER CONFIGURATION ---
+# --- VERSION 2.39 MASTER CONFIGURATION ---
 FILE_NAME = 'Consumption_export_Mer_Jan_Maerz_2026_Public Site 1.csv'
 INTERVAL_HOURS = 0.25 
 BIN_WIDTH = 10.0
 BASE_FIXED_START = 100.0 
+TARGET_UTIL_THRESHOLD = 2500.0
+EXCEEDANCE_TARGET = 2.0 
 
 try:
     # 0. MANUAL INPUTS
@@ -18,17 +20,7 @@ try:
     in_bess = input(f"Enter BESS Capacity (kWh) to simulate [at {USER_LIMIT}kW]: ")
     USER_BESS = float(in_bess.strip()) if in_bess.strip() else 50.0
 
-    # Economic Inputs (Updated Defaults)
-    in_kwh_cost = input("One-time Cost per 1 kWh BESS (EUR) [default 50]: ")
-    COST_KWH = float(in_kwh_cost.strip()) if in_kwh_cost.strip() else 50.0
-
-    in_kw_monthly = input("Monthly Fee per 1 kW Grid Limit (EUR) [default 0.5]: ")
-    MONTHLY_KW_FEE = float(in_kw_monthly.strip()) if in_kw_monthly.strip() else 0.5
-
-    in_roi = input("Expected RoI Time (Years) [default 5]: ")
-    ROI_YEARS = float(in_roi.strip()) if in_roi.strip() else 5.0
-
-    # 1. LOAD & FILTER DATA (3-MONTH SNAPSHOT)
+    # 1. LOAD & FILTER DATA (Q1 SNAPSHOT)
     df = pd.read_csv(FILE_NAME, sep=';|,', engine='python', header=None, 
                      usecols=[0, 1], names=['timestamp', 'station_1'], decimal=',')
     df['timestamp'] = pd.to_datetime(df['timestamp'].astype(str).str.strip(), dayfirst=True, errors='coerce')
@@ -42,7 +34,14 @@ try:
     df['day_name'] = df['timestamp'].dt.day_name()
     dummy_date = pd.to_datetime('2026-01-01')
 
-    # 2. CALCULATION LOGIC
+    # --- CALCULATIONS: ENERGY & UTILIZATION ---
+    ENERGY_Q1 = df['station_1'].sum() * INTERVAL_HOURS
+    ANNUAL_ENERGY_EST = ENERGY_Q1 * 4
+    MAX_PEAK_BASE = df['station_1'].max()
+    TARGET_PEAK_2500 = ANNUAL_ENERGY_EST / TARGET_UTIL_THRESHOLD
+    UTIL_HOURS_BASE = ANNUAL_ENERGY_EST / MAX_PEAK_BASE if MAX_PEAK_BASE > 0 else 0
+
+    # 2. CORE LOGIC FUNCTIONS
     def get_event_counts(series, limit):
         is_above = series > limit
         event_starts = is_above & (~is_above.shift(fill_value=False))
@@ -61,9 +60,9 @@ try:
         all_prefix_sums.sort(reverse=True)
         return all_prefix_sums[target_count]
 
-    # 3. BESS SIMULATION
-    current_bess = USER_BESS
+    # 3. BESS SIMULATION & AUDITS
     grid_with_bess = []
+    current_bess = USER_BESS
     for val in df['station_1']:
         if val > USER_LIMIT:
             energy_needed = (val - USER_LIMIT) * INTERVAL_HOURS
@@ -78,9 +77,11 @@ try:
             current_bess = USER_BESS 
             grid_with_bess.append(val)
     df['grid_with_bess'] = np.array(grid_with_bess)
+    
+    MAX_PEAK_BESS = df['grid_with_bess'].max()
+    UTIL_HOURS_BESS = ANNUAL_ENERGY_EST / MAX_PEAK_BESS if MAX_PEAK_BESS > 0 else 0
 
-    # 4. AUDITS & ECONOMIC OPTIMIZATION
-    def get_full_audit(series, limit):
+    def get_audit(series, limit):
         is_v = series > limit
         if not is_v.any(): return pd.DataFrame()
         v_id = (is_v != is_v.shift()).cumsum()
@@ -88,96 +89,69 @@ try:
         v_rows['e'] = (series[is_v] - limit) * INTERVAL_HOURS
         res = v_rows.groupby(v_id).agg({'timestamp':['min','max','count'], series.name:['max','mean'], 'e':'sum'})
         res.columns = ['Start','End','Intervals','Peak_kW','Avg_Power_kW','Energy_kWh']
-        res['Duration_Min'] = res['Intervals'] * 15
         res['Day'] = pd.to_datetime(res['Start']).dt.day_name()
         return res
 
-    audit_no_bess = get_full_audit(df['station_1'], USER_LIMIT)
-    audit_with_bess = get_full_audit(df['grid_with_bess'], USER_LIMIT)
+    audit_no_bess = get_audit(df['station_1'], USER_LIMIT)
+    audit_with_bess = get_audit(df['grid_with_bess'], USER_LIMIT)
     audit_no_bess.to_csv('V2_Audit_Baseline.csv', index=False)
     audit_with_bess.to_csv(f'V2_Audit_BESS_{int(USER_BESS)}kWh.csv', index=False)
 
-    total_data_hours = len(df) * INTERVAL_HOURS
-    hours_orig = (df['station_1'] > USER_LIMIT).sum() * INTERVAL_HOURS
-    hours_bess = (df['grid_with_bess'] > USER_LIMIT).sum() * INTERVAL_HOURS
-    pct_orig = (hours_orig / total_data_hours) * 100
-    pct_bess = (hours_bess / total_data_hours) * 100
-
-    # Optimization Sweep (3-Month Basis)
-    max_peak_val = df['station_1'].max()
-    sweep_limits = np.arange(BASE_FIXED_START, max_peak_val + 1, 1)
-    roi_months = ROI_YEARS * 12
-    
-    total_3m_expenses = []
-    for l in sweep_limits:
-        needed_kwh = calculate_bess_for_exceedance(df['station_1'], l, 0.0)
-        # BESS Investment depreciated for 3 months
-        bess_expense_3m = ((needed_kwh * COST_KWH) / roi_months) * 3
-        # Grid Fees for 3 months
-        grid_expense_3m = l * MONTHLY_KW_FEE * 3
-        total_3m_expenses.append(bess_expense_3m + grid_expense_3m)
-
-    opt_idx = np.argmin(total_3m_expenses)
-    OPT_LIMIT = sweep_limits[opt_idx]
-    OPT_KWH = calculate_bess_for_exceedance(df['station_1'], OPT_LIMIT, 0.0)
-    OPT_TOTAL_COST = total_3m_expenses[opt_idx]
-
-    # 5. VISUALIZATION SUITE
+    # 4. VISUALIZATION (7 CHARTS)
     plot_times = [pd.Timestamp.combine(dummy_date, t) for t in sorted(df['time_only'].unique())]
-    ev_freq_orig = get_event_counts(df['station_1'], USER_LIMIT)
-    ev_freq_bess = get_event_counts(df['grid_with_bess'], USER_LIMIT)
-    MAX_EV = max(ev_freq_orig.max(), ev_freq_bess.max()) + 1
-    MAX_PW = max_peak_val * 1.15
+    ev_orig = get_event_counts(df['station_1'], USER_LIMIT)
+    ev_bess = get_event_counts(df['grid_with_bess'], USER_LIMIT)
+    MAX_EV = max(ev_orig.max(), ev_bess.max()) + 1
+    MAX_PW = MAX_PEAK_BASE * 1.15
 
-    # V2_1 Baseline Profile
-    fig, ax1 = plt.subplots(figsize=(14, 8))
-    ax1.plot(plot_times, df.groupby('time_only')['station_1'].mean(), color='#1f77b4', alpha=0.6, label='Avg Power')
-    ax1.axhline(USER_LIMIT, color='black', linestyle='--', label='Limit')
-    ax1.set_ylabel('Power [kW]'); ax1.set_ylim(0, MAX_PW)
-    ax2 = ax1.twinx(); ax2.fill_between(plot_times, 0, ev_freq_orig, color='#d62728', alpha=0.3, step='post', label='Events')
-    ax2.set_ylabel('Event Count'); ax2.set_ylim(0, MAX_EV); ax2.yaxis.set_major_locator(mticker.MaxNLocator(integer=True))
-    plt.title(f'V2_1 Baseline: {hours_orig:.1f}h Over Limit ({pct_orig:.2f}%)')
-    ax1.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M')); fig.legend(loc="upper right", bbox_to_anchor=(0.9, 0.9)); plt.savefig('V2_1_Baseline_Events.png'); plt.close()
+    # V2_1 & V2_4: PROFILES (SYNCED AXES)
+    for suffix, data, events, color in [('Baseline', df['station_1'], ev_orig, '#d62728'), ('BESS', df['grid_with_bess'], ev_bess, '#1f77b4')]:
+        fig, ax1 = plt.subplots(figsize=(12, 7))
+        ax1.plot(plot_times, df.groupby('time_only')[data.name].mean(), color='gray', alpha=0.5, label='Avg Power')
+        ax1.axhline(USER_LIMIT, color='black', linestyle='--', label=f'Limit: {USER_LIMIT}kW')
+        ax1.set_ylim(0, MAX_PW); ax1.set_ylabel('Power [kW]'); ax1.set_xlabel('Time')
+        ax2 = ax1.twinx(); ax2.fill_between(plot_times, 0, events, color=color, alpha=0.3, step='post', label='Exceedance Events')
+        ax2.set_ylim(0, MAX_EV); ax2.set_ylabel('Events'); ax2.yaxis.set_major_locator(mticker.MaxNLocator(integer=True))
+        plt.title(f'Profile: {suffix}'); ax1.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+        plt.savefig(f'V2_{"1" if suffix=="Baseline" else "4"}_{suffix}_Events.png'); plt.close()
 
-    # V2_2 Histogram
-    plt.figure(figsize=(10, 6)); bin_edges = np.arange(0, audit_no_bess['Energy_kWh'].max() + BIN_WIDTH, BIN_WIDTH)
-    plt.hist(audit_no_bess['Energy_kWh'], bins=bin_edges, alpha=0.3, label='Baseline', color='red', edgecolor='black')
-    if not audit_with_bess.empty: plt.hist(audit_with_bess['Energy_kWh'], bins=bin_edges, alpha=0.7, label='BESS', color='green', edgecolor='black')
-    plt.title('V2_2 Violation Energy Distribution'); plt.xlabel('kWh'); plt.legend(); plt.savefig('V2_2_Distribution.png'); plt.close()
+    # V2_2: HISTOGRAM
+    plt.figure(figsize=(10, 6))
+    plt.hist(audit_no_bess['Energy_kWh'] if not audit_no_bess.empty else [], bins=20, alpha=0.3, color='red', label='Baseline')
+    if not audit_with_bess.empty: plt.hist(audit_with_bess['Energy_kWh'], bins=20, alpha=0.7, color='green', label='BESS')
+    plt.title('V2_2 Violation Distribution'); plt.xlabel('kWh'); plt.ylabel('Count'); plt.legend(); plt.savefig('V2_2_Distribution.png'); plt.close()
 
-    # V2_3 Dependency & ROI Optimum
-    cap_0 = [calculate_bess_for_exceedance(df['station_1'], l, 0.0) for l in sweep_limits]
-    cap_2 = [calculate_bess_for_exceedance(df['station_1'], l, 2.0) for l in sweep_limits]
-    plt.figure(figsize=(12, 8)); plt.fill_between(sweep_limits, cap_0, max(cap_0)+5, color='green', alpha=0.1)
-    plt.plot(sweep_limits, cap_0, color='darkred', label='0% Curve'); plt.plot(sweep_limits, cap_2, color='blue', linestyle='--', label='2% Curve')
-    plt.scatter(OPT_LIMIT, OPT_KWH, color='gold', s=200, edgecolors='black', label='Economic Optimum', zorder=5)
-    plt.title(f'V2_3 Optimization: {ROI_YEARS}yr ROI\nBESS: {COST_KWH}€/kWh | Grid: {MONTHLY_KW_FEE}€/kW/mo')
-    plt.xlabel('Limit [kW]'); plt.ylabel('BESS [kWh]'); plt.legend(); plt.grid(True, alpha=0.1)
-    plt.savefig('V2_3_Dependency_Curve.png'); plt.close()
+    # V2_3A, B, C: TRIPLE DEPENDENCY (0%, 2%, 2500h Zone)
+    sweep = np.arange(BASE_FIXED_START, MAX_PEAK_BASE + 5, 2)
+    c0 = np.array([calculate_bess_for_exceedance(df['station_1'], l, 0.0) for l in sweep])
+    c2 = np.array([calculate_bess_for_exceedance(df['station_1'], l, EXCEEDANCE_TARGET) for l in sweep])
 
-    # V2_4 BESS Profile
-    fig, ax1 = plt.subplots(figsize=(14, 8))
-    ax1.plot(plot_times, df.groupby('time_only')['grid_with_bess'].mean(), color='#2ca02c', alpha=0.6)
-    ax1.axhline(USER_LIMIT, color='black', linestyle='--'); ax1.set_ylabel('Power [kW]'); ax1.set_ylim(0, MAX_PW)
-    ax2 = ax1.twinx(); ax2.fill_between(plot_times, 0, ev_freq_bess, color='#1f77b4', alpha=0.3, step='post')
-    ax2.set_ylabel('Remaining Events'); ax2.set_ylim(0, MAX_EV); ax2.yaxis.set_major_locator(mticker.MaxNLocator(integer=True))
-    plt.title(f'V2_4 BESS Impact: {hours_bess:.1f}h Over Limit ({pct_bess:.2f}%)')
-    ax1.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M')); plt.savefig('V2_4_BESS_Events.png'); plt.close()
+    # A - Baseline
+    plt.figure(figsize=(10, 6)); plt.plot(sweep, c0, color='darkred', label='0%'); plt.xlabel('Limit [kW]'); plt.ylabel('BESS [kWh]')
+    plt.title('V2_3A: 0% Curve'); plt.legend(); plt.savefig('V2_3A_Baseline.png'); plt.close()
+    
+    # B - Comparison
+    plt.figure(figsize=(10, 6)); plt.plot(sweep, c0, color='darkred', label='0%'); plt.plot(sweep, c2, 'orange', linestyle='--', label='2%')
+    plt.title('V2_3B: Reliability Sensitivity'); plt.xlabel('Limit [kW]'); plt.ylabel('BESS [kWh]'); plt.legend(); plt.savefig('V2_3B_Comparison.png'); plt.close()
+    
+    # C - FINAL STRATEGIC MAP
+    plt.figure(figsize=(10, 6)); t_mask = sweep <= TARGET_PEAK_2500
+    plt.fill_between(sweep[t_mask], c2[t_mask], c0[t_mask], color='cyan', alpha=0.15, label='Efficiency Zone (<=2%)')
+    plt.fill_between(sweep[t_mask], c0[t_mask], max(c0)+5, color='dodgerblue', alpha=0.25, label='Zero-Risk Zone (0%)')
+    plt.plot(sweep, c0, color='darkred', label='0% Curve'); plt.plot(sweep, c2, 'orange', linestyle='--', label='2% Curve')
+    plt.axvline(TARGET_PEAK_2500, color='blue', linestyle='-.', label=f'2500h Line ({TARGET_PEAK_2500:.1f}kW)')
+    plt.title('V2_3C: Strategic Success Map'); plt.xlabel('Limit [kW]'); plt.ylabel('BESS [kWh]'); plt.legend(); plt.savefig('V2_3C_Final.png'); plt.close()
 
-    # V2_5 Weekly Breakdown
-    days_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+    # V2_5: WEEKLY
+    days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+    plt.figure(figsize=(10, 6))
     if not audit_no_bess.empty:
-        plt.figure(figsize=(10, 6))
-        w_orig = audit_no_bess['Day'].value_counts().reindex(days_order).fillna(0)
-        w_bess = audit_with_bess['Day'].value_counts().reindex(days_order).fillna(0) if not audit_with_bess.empty else pd.Series(0, index=days_order)
-        plt.bar(np.arange(7)-0.2, w_orig, width=0.4, label='Baseline', color='red', alpha=0.5)
-        plt.bar(np.arange(7)+0.2, w_bess, width=0.4, label='BESS', color='green')
-        plt.xticks(np.arange(7), days_order); plt.title('V2_5 Weekly Violation Frequency'); plt.legend(); plt.savefig('V2_5_Weekly.png'); plt.close()
+        w_o = audit_no_bess['Day'].value_counts().reindex(days).fillna(0)
+        plt.bar(np.arange(7), w_o, color='red', alpha=0.5)
+    plt.xticks(np.arange(7), days); plt.title('V2_5 Weekly Frequency'); plt.xlabel('Day'); plt.ylabel('Violations'); plt.savefig('V2_5_Weekly.png'); plt.close()
 
-    print(f"\n--- ECONOMIC SUMMARY (3-MONTH ANALYSIS) ---")
-    print(f"Optimal Grid Limit:      {OPT_LIMIT} kW")
-    print(f"Optimal BESS Capacity:  {OPT_KWH:.2f} kWh")
-    print(f"Min. 3m Expense (Sum):  {OPT_TOTAL_COST:,.2f} EUR")
+    print(f"\n--- ALL FEATURES GENERATED ---")
+    print(f"Annual Utilization (BESS): {UTIL_HOURS_BESS:,.0f} h")
 
 except Exception as e:
     print(f"Error: {e}")
