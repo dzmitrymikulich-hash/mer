@@ -154,4 +154,5 @@ try:
     print(f"Annual Utilization (BESS): {UTIL_HOURS_BESS:,.0f} h")
 
 except Exception as e:
-    print(f"Error: {e}")
+    import traceback
+    traceback.print_exc()
